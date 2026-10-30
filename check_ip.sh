@@ -1,109 +1,167 @@
+cat > check_ip.sh << 'EOF'
 #!/bin/bash
+# Не используем set -e, чтобы не падать на любом ненулевом коде curl
 
-set -euo pipefail
-
-# colors
-GREEN='\033[0;32m'
 RED='\033[0;31m'
+GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
 NC='\033[0m'
 
-declare -A results
+CONNECT_TIMEOUT=5
+MAX_TIMEOUT=10
+RESULTS=()
 
-# utils
-http_check() {
-    local name=$1 url=$2 expected=${3:-200} timeout=10
-    local code
-    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time "$timeout" -A "Mozilla/5.0" "$url" 2>/dev/null || echo "000")
-    if [[ "$code" == "$expected" ]]; then
-        results[$name]="${GREEN}Available${NC}"
-    elif [[ "$code" == "403" || "$code" == "429" || "$code" == "503" ]]; then
-        results[$name]="${YELLOW}Captcha/Block${NC}"
+log() { echo -e "${BLUE}[INFO]${NC} $*"; }
+ok() { echo -e "${GREEN}[OK]${NC} $*"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+err() { echo -e "${RED}[ERR]${NC} $*"; }
+
+add_result() { RESULTS+=("$1|$2|$3"); }
+
+check_http() {
+    local name="$1" url="$2"
+    local code body
+    code=$(curl -sS -o /dev/null -w "%{http_code}" \
+        --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIMEOUT" \
+        -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
+        -L "$url" 2>/dev/null) || code="000"
+
+    case "$code" in
+        2[0-9][0-9]|3[0-9][0-9])
+            add_result "$name" "доступен" "HTTP $code";;
+        401|403)
+            body=$(curl -sS --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIMEOUT" \
+                -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
+                -L "$url" 2>/dev/null | head -c 300)
+            if echo "$body" | grep -qi "cloudflare\|challenge\|ray id\|checking your browser"; then
+                add_result "$name" "капча/блок" "HTTP $code (Cloudflare)"
+            else
+                add_result "$name" "доступен" "HTTP $code (auth/forbidden)"
+            fi;;
+        429)
+            add_result "$name" "капча/лимит" "HTTP 429";;
+        000)
+            add_result "$name" "недоступен" "Timeout/Connection failed";;
+        *)
+            add_result "$name" "недоступен" "HTTP $code";;
+    esac
+    return 0
+}
+
+get_public_ip() {
+    log "Определение публичного IP..."
+    curl -sS --max-time 5 https://api.ipify.org 2>/dev/null || \
+    curl -sS --max-time 5 https://ifconfig.me 2>/dev/null || \
+    echo "unknown"
+}
+
+check_speed_cloudflare() {
+    log "Проверка скорости (Cloudflare)..."
+    local size_mb=5
+    local url="https://speed.cloudflare.com/__down?bytes=${size_mb}000000"
+    local start end duration mbps
+    start=$(date +%s.%N)
+    curl -sS -o /dev/null --max-time "$MAX_TIMEOUT" "$url" 2>/dev/null || true
+    end=$(date +%s.%N)
+    duration=$(awk "BEGIN {print $end - $start}")
+    if awk "BEGIN {exit !($duration > 0)}"; then
+        mbps=$(awk "BEGIN {printf \"%.2f\", ($size_mb * 8) / $duration}")
+        ok "Скорость: ~${mbps} Mbps"
+        add_result "Speedtest (Cloudflare)" "доступен" "${mbps} Mbps"
     else
-        results[$name]="${RED}Unavailable ($code)${NC}"
+        warn "Не удалось измерить скорость"
+        add_result "Speedtest (Cloudflare)" "недоступен" "Failed"
     fi
 }
 
-dns_check() {
-    local name=$1 host=$2
-    if dig +short +time=5 "$host" @1.1.1.1 | grep -qE '^[0-9]+\.'; then
-        results[$name]="${GREEN}Available${NC}"
-    else
-        results[$name]="${RED}Unavailable${NC}"
-    fi
+check_ai() {
+    log "Проверка AI..."
+    check_http "Grok (x.ai)" "https://api.x.ai/v1/models" || true
+    check_http "Anthropic" "https://api.anthropic.com/v1/messages" || true
+    check_http "Gemini" "https://generativelanguage.googleapis.com/v1beta/models" || true
+    check_http "ChatGPT (OpenAI)" "https://api.openai.com/v1/models" || true
 }
 
-# ip
-echo "Detecting IP..."
-IP=$(curl -s --max-time 10 https://api.ipify.org || echo "Undetermined")
-COUNTRY=$(curl -s --max-time 10 "https://ipapi.co/${IP}/country_name" 2>/dev/null || echo "?")
-ASN=$(curl -s --max-time 10 "https://ipapi.co/${IP}/org" 2>/dev/null || echo "?")
-echo -e "IP: ${GREEN}$IP${NC} | Country: $COUNTRY | ASN: $ASN"
+check_social() {
+    log "Проверка соцсетей..."
+    check_http "Instagram" "https://www.instagram.com/" || true
+    check_http "Twitter/X" "https://x.com/" || true
+    check_http "Reddit" "https://www.reddit.com/" || true
+    check_http "Spotify" "https://www.spotify.com/" || true
+}
 
-# speedtest
-echo "Running speed test..."
-if command -v speedtest-cli &>/dev/null; then
-    speedtest-cli --simple --timeout 30 2>/dev/null | sed 's/^/  /'
-elif command -v fast &>/dev/null; then
-    fast 2>/dev/null | sed 's/^/  /'
-else
-    # fallbacks
-    DL=$(curl -s -o /dev/null -w "%{speed_download}" --max-time 20 https://speed.cloudflare.com/__down?bytes=10485760 2>/dev/null || echo 0)
-    UL=$(curl -s -o /dev/null -w "%{speed_upload}" --max-time 20 -T /dev/zero https://speed.cloudflare.com/__up 2>/dev/null || echo 0)
-    printf "  Download: %.2f Mbps\n" "$(echo "$DL*8/1000000" | bc -l)"
-    printf "  Upload:   %.2f Mbps\n" "$(echo "$UL*8/1000000" | bc -l)"
-fi
+check_dev() {
+    log "Проверка Dev / Cloudflare / IPQuality..."
+    check_http "GitHub" "https://github.com/" || true
+    check_http "GitLab" "https://gitlab.com/" || true
+    check_http "Cloudflare" "https://cloudflare.com/" || true
+    check_http "MaxMind API" "https://geoip.maxmind.com/geoip/v2.1/city/me" || true
+}
 
-# check
-echo "Checking services..."
+check_google() {
+    log "Проверка Google..."
+    check_http "Google Search" "https://www.google.com/" || true
+    check_http "YouTube" "https://www.youtube.com/" || true
+    check_http "Gmail" "https://mail.google.com/" || true
+    check_http "Google Drive" "https://drive.google.com/" || true
+}
 
-# AI
-http_check "Grok (x.ai)" "https://api.x.ai/v1/models" 200
-http_check "Anthropic" "https://api.anthropic.com/v1/messages" 401  # 401 = API works, key required
-http_check "Gemini" "https://generativelanguage.googleapis.com/v1beta/models" 200
-http_check "Perplexity" "https://api.perplexity.ai/models" 401
-http_check "ChatGPT" "https://api.openai.com/v1/models" 401
-
-# social
-http_check "Instagram" "https://www.instagram.com/" 200
-http_check "Twitter/X" "https://x.com/" 200
-http_check "Reddit" "https://www.reddit.com/" 200
-http_check "Spotify" "https://open.spotify.com/" 200
-
-# dev / tools
-http_check "GitHub" "https://github.com/" 200
-http_check "GitLab" "https://gitlab.com/" 200
-http_check "Cloudflare Challenge" "https://challenges.cloudflare.com/cdn-cgi/trace" 200
-http_check "IPQualityScore" "https://www.ipqualityscore.com/api/json/ip/$(curl -s ipinfo.io/ip 2>/dev/null)/check" 200
-http_check "MaxMind GeoIP" "https://geoip.maxmind.com/geoip/v2.1/country/me" 401  # 401 = works, license key required
-
-# google ecosystem
-http_check "Google Search" "https://www.google.com/" 200
-http_check "YouTube" "https://www.youtube.com/" 200
-http_check "Gmail" "https://mail.google.com/" 200
-
-# DNS checks
-dns_check "Google DNS" "google.com"
-dns_check "Cloudflare DNS" "cloudflare.com"
-
-# table
 print_table() {
-    local col1=30 col2=20
-    printf "\n%*s | %*s\n" "$col1" "Service" "$col2" "Status"
-    printf "%*s-+-%*s\n" "$col1" "" "$col2" "" | tr ' ' '-'
-    for k in "${!results[@]}"; do
-        printf "%*s | %b\n" "$col1" "$k" "${results[$k]}"
-    done
     echo
+    echo "═══════════════════════════════════════════════════════════════════"
+    echo "                    IP QUALITY CHECK REPORT"
+    echo "═══════════════════════════════════════════════════════════════════"
+    printf "  IP: %s\n" "$PUBLIC_IP"
+    printf "  Время: %s\n" "$(date '+%Y-%m-%d %H:%M:%S')"
+    echo "──────────────────────────────────────────────────────────────────"
+    printf "  %-30s  %-14s  %s\n" "СЕРВИС" "СТАТУС" "ДЕТАЛИ"
+    echo "──────────────────────────────────────────────────────────────────"
+    for row in "${RESULTS[@]}"; do
+        IFS='|' read -r name status details <<< "$row"
+        local c="$NC"
+        case "$status" in
+            "доступен") c="$GREEN";;
+            "капча/"*) c="$YELLOW";;
+            "недоступен") c="$RED";;
+        esac
+        printf "  %-30s  ${c}%-14s${NC}  %s\n" "$name" "$status" "$details"
+    done
+    echo "──────────────────────────────────────────────────────────────────"
+    local total=${#RESULTS[@]} ok=0 warn=0 fail=0
+    for row in "${RESULTS[@]}"; do
+        IFS='|' read -r _ s _ <<< "$row"
+        case "$s" in
+            "доступен") ((ok++));;
+            "капча/"*) ((warn++));;
+            "недоступен") ((fail++));;
+        esac
+    done
+    printf "  Итого: ${GREEN}%d доступно${NC}, ${YELLOW}%d капча/лимит${NC}, ${RED}%d недоступно${NC} (из %d)\n" "$ok" "$warn" "$fail" "$total"
+    echo "═══════════════════════════════════════════════════════════════════"
 }
-print_table
 
-# --- Summary ---
-blocked=0
-captcha=0
-for v in "${results[@]}"; do
-    [[ "$v" == *"Unavailable"* ]] && ((blocked++))
-    [[ "$v" == *"Captcha"* ]] && ((captcha++))
-done
-echo "Summary: Blocked: $blocked | Captcha/Restrictions: $captcha | Total checks: ${#results[@]}"
-[[ $blocked -gt 0 || $captcha -gt 0 ]] && echo -e "${YELLOW}⚠ IP likely in blocklists / needs review${NC}" || echo -e "${GREEN}✓ IP looks clean${NC}"
+main() {
+    echo "╔══════════════════════════════════════════════════════════════════╗"
+    echo "║                    IP QUALITY CHECKER v1.0                       ║"
+    echo "╚══════════════════════════════════════════════════════════════════╝"
+    PUBLIC_IP=$(get_public_ip)
+    log "Публичный IP: $PUBLIC_IP"
+    check_speed_cloudflare
+    check_ai
+    check_social
+    check_dev
+    check_google
+    print_table
+    for row in "${RESULTS[@]}"; do
+        IFS='|' read -r _ s _ <<< "$row"
+        if [[ "$s" == "недоступен" || "$s" == "капча/"* ]]; then exit 1; fi
+    done
+    exit 0
+}
+
+for cmd in curl awk; do command -v "$cmd" >/dev/null 2>&1 || { err "Нужен $cmd"; exit 1; }; done
+main "$@"
+EOF
+chmod +x check_ip.sh
+./check_ip.sh
